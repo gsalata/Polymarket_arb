@@ -519,110 +519,42 @@ def synth_orderbook(base_price):
 # ─────────────────────────────────────────────
 # MAIN SCAN LOOP (one iteration)
 # ─────────────────────────────────────────────
-def scan_markets_once(markets: list, params: dict):
-    """Scan all markets for arb, return results list."""
-    threshold = params["profit_threshold_bps"] / 10000
-    results = []
+    # ── Main scan ──
+    if st.session_state.running:
+        now = time.time()
+        interval = st.session_state.refresh_interval_sec
 
-    for m in markets:
-        q     = m["question"]
-        cid   = m["condition_id"]
-        synth = cid.startswith("synth_")
+        if now - st.session_state.last_fetch >= interval:
+            st.session_state.last_fetch = now
 
-        if synth:
-            base_yes = m.get("_synth_yes_ask", 0.5)
-            base_no  = m.get("_synth_no_ask",  0.5)
-            # random walk
-            m["_synth_yes_ask"] = max(0.02, min(0.97, base_yes + random.gauss(0, 0.004)))
-            m["_synth_no_ask"]  = max(0.02, min(0.97, base_no  + random.gauss(0, 0.004)))
-            ob_yes = synth_orderbook(m["_synth_yes_ask"])
-            ob_no  = synth_orderbook(m["_synth_no_ask"])
+            with st.spinner("🔍 Fetching markets & scanning orderbooks..."):
+                if st.session_state.live_mode:
+                    markets = fetch_markets(
+                        min_volume=st.session_state.min_volume_usd,
+                        limit=st.session_state.max_markets,
+                    )
+                    if not markets:
+                        st.warning("No live markets returned. Check network or try synthetic mode.")
+                        markets = []
+                    # ✅ pin ONLY in live mode
+                    markets = ensure_pinned_market(markets, PINNED_MARKET_SLUG)
+                else:
+                    markets = generate_synthetic_markets(st.session_state.max_markets)
+
+                if markets:
+                    params = {k: st.session_state[k] for k in DEFAULT_PARAMS}
+                    results = scan_markets_once(markets, params)
+                    st.session_state["last_results"] = results
+                    log(f"Scan complete: {len(results)} markets checked")
+                else:
+                    st.warning("No markets to scan (including pinned).")
         else:
-            ob_yes = fetch_orderbook(m["yes_token"])
-            ob_no  = fetch_orderbook(m["no_token"])
-            time.sleep(0.2)  # rate limit courtesy
+            countdown = interval - int(now - st.session_state.last_fetch)
+            st.caption(f"⏱ Next scan in {countdown}s")
 
-        a_yes = best_ask(ob_yes)
-        a_no  = best_ask(ob_no)
-        b_yes = best_bid(ob_yes)
-        b_no  = best_bid(ob_no)
-
-        if a_yes is None or a_no is None:
-            results.append({
-                "question": q[:60],
-                "yes_ask": None, "no_ask": None,
-                "raw_edge": None, "net_edge": None,
-                "status": "NO DATA", "pnl": 0,
-                "condition_id": cid,
-            })
-            continue
-
-        eff = get_effective_prices(a_yes, b_yes or 0, a_no, b_no or 0)
-        buy_yes = eff["effective_buy_yes"]
-        buy_no  = eff["effective_buy_no"]
-
-        raw_edge, net_edge = compute_edge(
-            buy_yes, buy_no,
-            clob_fee=params["clob_fee_pct"] / 100,
-            gas_usd=params["gas_merge_usd"],
-            swap_spread=params["swap_spread_pct"] / 100,
-            buffer_bps=params["buffer_bps"],
-            trade_size_usd=params["min_trade_usd"],
-        )
-
-        st.session_state.edge_history.append({
-            "ts": time.time(),
-            "market": q[:30],
-            "raw_edge_pct": raw_edge * 100,
-            "net_edge_pct": net_edge * 100,
-        })
-
-        status  = "COLD"
-        sim_pnl = 0.0
-
-        if net_edge > threshold:
-            st.session_state.total_opps += 1
-            status = "HOT 🔥"
-            exec_result = simulate_execution(buy_yes, buy_no, net_edge, params)
-            if exec_result:
-                sim_pnl = exec_result["net_pnl"]
-                st.session_state.total_pnl    += sim_pnl
-                st.session_state.total_trades += 1
-                ts = datetime.now().strftime("%H:%M:%S")
-                trade = {
-                    "ts": ts, "question": q[:50],
-                    "buy_yes": buy_yes, "buy_no": buy_no,
-                    "raw_edge_pct": raw_edge * 100,
-                    "net_edge_pct": net_edge * 100,
-                    "net_pnl": sim_pnl,
-                    "trade_size": exec_result["trade_size_usd"],
-                    "fill_pct":   exec_result["fill_pct"],
-                }
-                st.session_state.trade_history.append(trade)
-                st.session_state.pnl_series.append({
-                    "ts": ts,
-                    "cumulative_pnl": st.session_state.total_pnl,
-                })
-                log(f"[ARB] {q[:45]}... | edge={net_edge*100:.2f}bps | PnL=+${sim_pnl:.2f}", "arb")
-                status = "EXECUTED ✓"
-        elif raw_edge > 0:
-            status = "WARM"
-
-        results.append({
-            "question": q[:60],
-            "yes_ask": a_yes,
-            "no_ask":  a_no,
-            "raw_edge": raw_edge * 100,
-            "net_edge": net_edge * 100,
-            "status": status,
-            "pnl": sim_pnl,
-            "condition_id": cid,
-            "volume": m.get("volume", 0),
-        })
-
-    return results
-
-# ─────────────────────────────────────────────
+        # auto-rerun
+        time.sleep(0.5)
+        st.rerun()# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
