@@ -280,7 +280,55 @@ init_state()
 def log(msg: str, level: str = "info"):
     ts = datetime.now().strftime("%H:%M:%S")
     st.session_state.logs.appendleft({"ts": ts, "msg": msg, "level": level})
+PINNED_MARKET_SLUG = "btc-updown-5m-1771611600"
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_market_by_slug(slug: str):
+    """Resolve a Polymarket market from Gamma by slug. Cached to avoid Streamlit rerun spam."""
+    try:
+        r = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"slug": slug},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+
+        m = data[0]
+        if len(m.get("outcomes", [])) != 2 or len(m.get("clobTokenIds", [])) != 2:
+            return None
+
+        return {
+            "question": m.get("question", slug),
+            "condition_id": m.get("conditionId") or m.get("condition_id"),
+            "yes_token": m["clobTokenIds"][0],
+            "no_token":  m["clobTokenIds"][1],
+            "volume": float(m.get("volume", 0)),
+            "_pinned": True,
+        }
+    except Exception:
+        return None
+
+
+def ensure_pinned_market(markets: list, slug: str):
+    """Force-include a pinned market in the scan universe (dedupe by condition_id)."""
+    if not slug:
+        return markets
+
+    pinned = fetch_market_by_slug(slug)
+    if not pinned:
+        log(f"[PINNED] Could not load pinned market slug={slug}", "warning")
+        return markets
+
+    cid = pinned.get("condition_id")
+    if cid:
+        markets = [m for m in markets if m.get("condition_id") != cid]
+
+    markets.insert(0, pinned)  # scan pinned first
+    st.session_state["pinned_market"] = pinned
+    return markets
 def get_effective_prices(yes_ask, yes_bid, no_ask, no_bid):
     """Compute effective buy/sell prices (mimics article's price_utils)."""
     spread_yes = yes_ask - yes_bid if yes_bid > 0 else 0
@@ -370,7 +418,7 @@ def fetch_markets(min_volume=100_000, limit=20):
                         "volume": vol,
                         "outcomes": outcomes,
                     })
-        return markets[:limit]
+        return markets if (limit is None or limit == 0) else markets[:limit]
     except Exception as e:
         log(f"[API] Gamma fetch error: {e}", "err")
         return []
@@ -729,34 +777,28 @@ with tabs[0]:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Main scan ──
-    if st.session_state.running:
-        now = time.time()
-        interval = st.session_state.refresh_interval_sec
+   if st.session_state.live_mode:
+    markets = fetch_markets(
+        min_volume=st.session_state.min_volume_usd,
+        limit=st.session_state.max_markets,
+    )
+    if not markets:
+        st.warning("No live markets returned. Check network or try synthetic mode.")
+        markets = []
+else:
+    markets = generate_synthetic_markets(st.session_state.max_markets)
 
-        if now - st.session_state.last_fetch >= interval:
-            st.session_state.last_fetch = now
+# ✅ ALWAYS add pinned market in LIVE mode (even if list is empty)
+if st.session_state.live_mode:
+    markets = ensure_pinned_market(markets, PINNED_MARKET_SLUG)
 
-            with st.spinner("🔍 Fetching markets & scanning orderbooks..."):
-                if st.session_state.live_mode:
-                    markets = fetch_markets(
-                        min_volume=st.session_state.min_volume_usd,
-                        limit=st.session_state.max_markets,
-                    )
-                    if not markets:
-                        st.warning("No live markets returned. Check network or try synthetic mode.")
-                        markets = []
-                else:
-                    markets = generate_synthetic_markets(st.session_state.max_markets)
-
-                if markets:
-                    params = {k: st.session_state[k] for k in DEFAULT_PARAMS}
-                    results = scan_markets_once(markets, params)
-                    st.session_state["last_results"] = results
-                    log(f"Scan complete: {len(results)} markets checked")
-        else:
-            countdown = interval - int(now - st.session_state.last_fetch)
-            st.caption(f"⏱ Next scan in {countdown}s")
-
+if markets:
+    params = {k: st.session_state[k] for k in DEFAULT_PARAMS}
+    results = scan_markets_once(markets, params)
+    st.session_state["last_results"] = results
+    log(f"Scan complete: {len(results)} markets checked")
+else:
+    st.warning("No markets to scan (including pinned).")
         # auto-rerun
         time.sleep(0.5)
         st.rerun()
