@@ -709,29 +709,45 @@ with tabs[0]:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Main scan ──
-   if st.session_state.live_mode:
-    markets = fetch_markets(
-        min_volume=st.session_state.min_volume_usd,
-        limit=st.session_state.max_markets,
-    )
-    if not markets:
-        st.warning("No live markets returned. Check network or try synthetic mode.")
-        markets = []
-else:
-    markets = generate_synthetic_markets(st.session_state.max_markets)
+    if st.session_state.running:
+        now = time.time()
+        interval = st.session_state.refresh_interval_sec
 
-# ✅ ALWAYS add pinned market in LIVE mode (even if list is empty)
-if st.session_state.live_mode:
-    markets = ensure_pinned_market(markets, PINNED_MARKET_SLUG)
+        if now - st.session_state.last_fetch >= interval:
+            st.session_state.last_fetch = now
 
-if markets:
-    params = {k: st.session_state[k] for k in DEFAULT_PARAMS}
-    results = scan_markets_once(markets, params)
-    st.session_state["last_results"] = results
-    log(f"Scan complete: {len(results)} markets checked")
-else:
-    st.warning("No markets to scan (including pinned).")
-        # auto-rerun
+            with st.spinner("🔍 Fetching markets & scanning orderbooks..."):
+
+                if st.session_state.live_mode:
+                    markets = fetch_markets(
+                        min_volume=st.session_state.min_volume_usd,
+                        limit=st.session_state.max_markets,
+                    )
+
+                    if not markets:
+                        st.warning("No live markets returned. Check filters or network.")
+                        markets = []
+
+                    # ✅ ALWAYS include pinned market (LIVE ONLY)
+                    markets = ensure_pinned_market(markets, PINNED_MARKET_SLUG)
+
+                else:
+                    markets = generate_synthetic_markets(
+                        st.session_state.max_markets
+                    )
+
+                if markets:
+                    params = {k: st.session_state[k] for k in DEFAULT_PARAMS}
+                    results = scan_markets_once(markets, params)
+                    st.session_state["last_results"] = results
+                    log(f"Scan complete: {len(results)} markets checked")
+                else:
+                    st.warning("No markets to scan.")
+
+        else:
+            countdown = interval - int(now - st.session_state.last_fetch)
+            st.caption(f"⏱ Next scan in {countdown}s")
+
         time.sleep(0.5)
         st.rerun()
 
